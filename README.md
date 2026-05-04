@@ -2,11 +2,11 @@
 
 Kaggle competition: Acoustic Species Identification in the Pantanal
 
+
 ## Results So Far
 | Exp | Backbone | AUC |
 |---|---|---|
 | exp006 | EfficientNet-B5 + Soundscapes | 0.9583 |
-| exp009 | EfficientNet-B5 + Soundscapes fold2 | training |
 
 ## Structure
 - config.py — all hyperparameters
@@ -15,3 +15,5 @@ Kaggle competition: Acoustic Species Identification in the Pantanal
 - train.py — training loop
 - inference.py — local inference
 - kaggle_inference.py — Kaggle submission
+## Ref
+https://www.kaggle.com/competitions/birdclef-2026
