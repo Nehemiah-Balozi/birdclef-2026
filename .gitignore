@@ -1,0 +1,23 @@
+# Large data files
+train_audio/
+train_soundscapes/
+test_soundscapes/
+pseudo_labels/
+*.ogg
+*.wav
+*.mp3
+
+# Model checkpoints (too large)
+experiments/
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Jupyter
+*.ipynb_checkpoints/
+
+# Logs
+*.log
