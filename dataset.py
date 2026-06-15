@@ -143,11 +143,81 @@ def mel_to_db() -> T.AmplitudeToDB:
 def normalize_melspec(melspec: torch.Tensor) -> torch.Tensor:
     """
     Per-sample global normalization: ``(x - mean) / (std + 1e-6)`` over all
-    elements of the spectrogram tensor.
+    elements of the spectrogram tensor. Returns zeros if ``std`` is near zero
+    to avoid NaNs.
     """
     mean = melspec.mean()
     std = melspec.std()
+    if std < 1e-8:
+        return torch.zeros_like(melspec)
     return (melspec - mean) / (std + 1e-6)
+
+
+def apply_pcen(
+    mel: torch.Tensor,
+    *,
+    sample_rate: int | None = None,
+    hop_length: int | None = None,
+    time_constant: float | None = None,
+    eps: float | None = None,
+    gain: float | None = None,
+    bias: float | None = None,
+    power: float | None = None,
+) -> torch.Tensor:
+    """Per-Channel Energy Normalization on a magnitude/power mel spectrogram.
+
+    Implements::
+
+        M_t   = (1 - s) * M_{t-1} + s * E_t                   (causal IIR low-pass)
+        PCEN_t = (E_t / (eps + M_t)^alpha + delta)^r - delta^r
+
+    where ``s = 1 - exp(-(hop_length / sample_rate) / time_constant)`` and the
+    smoother runs per mel bin along the time axis (via
+    ``torchaudio.functional.lfilter`` so a 256-bin spectrogram is filtered in
+    one C++ call instead of a Python loop).
+
+    PCEN suppresses stationary background energy (cicadas, wind, recorder hum)
+    while preserving transients like bird calls — generally more robust than
+    log-mel for noisy soundscapes (Wang, Lostanlen, Cella & Bello, 2017
+    — *Trainable frontend for robust and far-field keyword spotting*).
+
+    Inputs are clamped to ``>= 0`` for numerical safety; output has the same
+    shape as ``mel``. Each ``None`` argument falls back to ``config.mel``.
+    """
+    import math
+
+    from torchaudio.functional import lfilter
+
+    m = config.mel
+    sr = sample_rate if sample_rate is not None else config.audio.sample_rate
+    hop = hop_length if hop_length is not None else m.hop_length
+    tau = time_constant if time_constant is not None else m.pcen_time_constant
+    e_eps = eps if eps is not None else m.pcen_eps
+    alpha = gain if gain is not None else m.pcen_gain
+    delta = bias if bias is not None else m.pcen_bias
+    r = power if power is not None else m.pcen_power
+
+    s = 1.0 - math.exp(-(hop / sr) / tau)
+
+    E = mel.clamp(min=0.0)
+    if E.shape[-1] == 0:
+        return E
+
+    a_coeffs = torch.tensor([1.0, -(1.0 - s)], dtype=E.dtype, device=E.device)
+    b_coeffs = torch.tensor([s, 0.0], dtype=E.dtype, device=E.device)
+    M = lfilter(E, a_coeffs, b_coeffs, clamp=False)
+
+    smoother = (e_eps + M).pow(alpha)
+    return (E / smoother + delta).pow(r) - (delta ** r)
+
+
+def _postprocess_mel(
+    raw_mel: torch.Tensor, db_transform: T.AmplitudeToDB
+) -> torch.Tensor:
+    """Magnitude/power mel → model-ready spectrogram (PCEN or log-mel + norm)."""
+    if config.mel.use_pcen:
+        return apply_pcen(raw_mel)
+    return normalize_melspec(db_transform(raw_mel))
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +447,8 @@ class BirdCLEFDataset(Dataset):
         Must include ``filepath``, ``primary_label``, ``secondary_labels``,
         ``rating``, ``collection`` (``filepath`` is typically added upstream).
     mode :
-        ``'train'`` → random crop + optional SpecAugment;
+        ``'train'`` → random crop, optional soundscape noise mix, optional gain scale,
+        optional SpecAugment;
         ``'val'`` → center crop, no augmentation.
     """
 
@@ -393,11 +464,15 @@ class BirdCLEFDataset(Dataset):
         self.label_encoder = label_encoder
         self.mode = mode
         self.n_samples = config.audio.n_samples
+        self._noise_files: tuple[str, ...] = ()
+        if mode == "train" and config.augmentation.use_noise_mix:
+            root = Path(config.paths.train_soundscapes)
+            self._noise_files = tuple(sorted(str(p) for p in root.glob("*.ogg")))
         self.mel_xfm = build_mel_transform()
         self.db_xfm = mel_to_db()
         with torch.inference_mode():
             dummy = torch.zeros(1, self.n_samples)
-            ref = normalize_melspec(self.db_xfm(self.mel_xfm(dummy)))
+            ref = _postprocess_mel(self.mel_xfm(dummy), self.db_xfm)
             self._empty_melspec = torch.zeros_like(ref)
 
     def __len__(self) -> int:
@@ -421,11 +496,30 @@ class BirdCLEFDataset(Dataset):
             wav = load_audio(fp)
             if self.mode == "train":
                 wav = random_crop(wav, self.n_samples)
+                if (
+                    config.augmentation.use_noise_mix
+                    and self._noise_files
+                    and random.random() < config.augmentation.noise_mix_prob
+                ):
+                    try:
+                        noise_fp = random.choice(self._noise_files)
+                        noise_wav = load_audio(noise_fp)
+                        noise_wav = random_crop(noise_wav, self.n_samples)
+                        a = config.augmentation
+                        alpha = random.uniform(a.noise_mix_alpha_min, a.noise_mix_alpha_max)
+                        wav = wav * alpha + noise_wav * (1.0 - alpha)
+                    except Exception:
+                        pass
+                if (
+                    config.augmentation.use_gain_aug
+                    and random.random() < config.augmentation.gain_aug_prob
+                ):
+                    a = config.augmentation
+                    gain = random.uniform(a.gain_min, a.gain_max)
+                    wav = wav * gain
             else:
                 wav = center_crop(wav, self.n_samples)
-            mel = self.mel_xfm(wav)
-            mel = self.db_xfm(mel)
-            mel = normalize_melspec(mel)
+            mel = _postprocess_mel(self.mel_xfm(wav), self.db_xfm)
             if self.mode == "train" and config.augmentation.use_specaugment:
                 mel = apply_spec_augment(mel)
             return {
@@ -474,7 +568,7 @@ class SoundscapeDataset(Dataset):
         self.db_xfm = mel_to_db()
         with torch.inference_mode():
             dummy = torch.zeros(1, self.n_samples)
-            ref = normalize_melspec(self.db_xfm(self.mel_xfm(dummy)))
+            ref = _postprocess_mel(self.mel_xfm(dummy), self.db_xfm)
             self._empty_melspec = torch.zeros_like(ref)
 
     def __len__(self) -> int:
@@ -506,9 +600,7 @@ class SoundscapeDataset(Dataset):
             if sr != self.sr:
                 wav = torchaudio.functional.resample(wav, sr, self.sr)
             wav = center_crop(wav, self.n_samples)
-            mel = self.mel_xfm(wav)
-            mel = self.db_xfm(mel)
-            mel = normalize_melspec(mel)
+            mel = _postprocess_mel(self.mel_xfm(wav), self.db_xfm)
             return {
                 "melspec": mel,
                 "labels": self._encode_scape_labels(row["primary_label"]),
@@ -548,7 +640,7 @@ class PseudoLabelDataset(Dataset):
         self.db_xfm = mel_to_db()
         with torch.inference_mode():
             dummy = torch.zeros(1, self.n_samples)
-            ref = normalize_melspec(self.db_xfm(self.mel_xfm(dummy)))
+            ref = _postprocess_mel(self.mel_xfm(dummy), self.db_xfm)
             self._empty_melspec = torch.zeros_like(ref)
 
     def __len__(self) -> int:
@@ -580,9 +672,7 @@ class PseudoLabelDataset(Dataset):
             if sr != self.sr:
                 wav = torchaudio.functional.resample(wav, sr, self.sr)
             wav = center_crop(wav, self.n_samples)
-            mel = self.mel_xfm(wav)
-            mel = self.db_xfm(mel)
-            mel = normalize_melspec(mel)
+            mel = _postprocess_mel(self.mel_xfm(wav), self.db_xfm)
             if self.mode == "train" and config.augmentation.use_specaugment:
                 mel = apply_spec_augment(mel)
             return {
@@ -606,9 +696,11 @@ def get_dataloaders(fold: int) -> tuple[DataLoader, DataLoader]:
     - Loads ``train.csv``, adds ``filepath``, applies XC low-rating filter,
       and assigns ``site_group`` from rounded lat/lon (fallback to
       ``StratifiedKFold`` if group stratification fails).
-    - Training set: reference audio for all non-validation indices.
-    - Validation set: ``ConcatDataset`` of reference val split and
-      deduplicated expert ``SoundscapeDataset`` rows.
+    - Training set: XC reference audio (non-val fold indices) plus **80%** of
+      labeled soundscape **segments** (all 66 files represented; no file-level
+      holdout — random segment split at ``config.training.seed``).
+    - Validation set: **only** the held-out **20%** of soundscape segments
+      (honest val — no XC).
 
     Parameters
     ----------
@@ -623,7 +715,7 @@ def get_dataloaders(fold: int) -> tuple[DataLoader, DataLoader]:
     df = _apply_xc_low_rating_filter(df)
     df["site_group"] = [_site_group_key(a, b) for a, b in zip(df["latitude"], df["longitude"])]
 
-    train_idx, val_idx = _stratified_split_indices(
+    train_idx, _ = _stratified_split_indices(
         df,
         n_folds=config.training.n_folds,
         val_fold=fold,
@@ -631,7 +723,6 @@ def get_dataloaders(fold: int) -> tuple[DataLoader, DataLoader]:
     )
 
     train_df = df.iloc[train_idx].reset_index(drop=True)
-    val_df = df.iloc[val_idx].reset_index(drop=True)
 
     enc = LabelEncoder()
 
@@ -639,26 +730,32 @@ def get_dataloaders(fold: int) -> tuple[DataLoader, DataLoader]:
     scape = scape.drop_duplicates(subset=["filename", "start", "end"], keep="first").reset_index(
         drop=True
     )
-    scape_files = sorted(scape["filename"].astype(str).unique().tolist())
-    random.seed(config.training.seed)
-    random.shuffle(scape_files)
-    n_train_files = int(len(scape_files) * 0.8)
-    train_scape_files = set(scape_files[:n_train_files])
-    val_scape_files = set(scape_files[n_train_files:])
-    train_scape_df = scape[scape["filename"].astype(str).isin(train_scape_files)].reset_index(
-        drop=True
-    )
-    val_scape_df = scape[scape["filename"].astype(str).isin(val_scape_files)].reset_index(drop=True)
+    n_seg = len(scape)
+    rng = np.random.default_rng(config.training.seed)
+    perm = rng.permutation(n_seg) if n_seg else np.array([], dtype=np.int64)
+    n_val = 0
+    if n_seg > 0:
+        n_val = int(round(0.2 * n_seg))
+        if n_val < 1:
+            n_val = 1
+        if n_val >= n_seg and n_seg > 1:
+            n_val = n_seg - 1
+        elif n_val >= n_seg:
+            n_val = n_seg
+    val_idx = perm[:n_val]
+    train_idx_seg = perm[n_val:]
+    train_scape_df = scape.iloc[train_idx_seg].reset_index(drop=True)
+    val_scape_df = scape.iloc[val_idx].reset_index(drop=True)
     print(
-        f"Soundscape split segments - train: {len(train_scape_df)}, val: {len(val_scape_df)}"
+        f"Soundscape segment split (20% val, all files in pool) — "
+        f"train segments: {len(train_scape_df)}, val segments: {len(val_scape_df)}"
     )
 
     train_ref = BirdCLEFDataset(train_df, enc, mode="train")
-    val_ref = BirdCLEFDataset(val_df, enc, mode="val")
     train_scape = SoundscapeDataset(train_scape_df, enc, mode="train")
     val_scape = SoundscapeDataset(val_scape_df, enc, mode="val")
     train_ds: Dataset = ConcatDataset([train_ref, train_scape])
-    val_ds: Dataset = ConcatDataset([val_ref, val_scape])
+    val_ds: Dataset = val_scape
 
     nw = config.training.num_workers
     pw = nw > 0

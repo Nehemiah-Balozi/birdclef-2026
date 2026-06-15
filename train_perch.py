@@ -1,5 +1,8 @@
 """
-BirdCLEF+ 2026 — single-GPU training loop with mixed precision and CSV logging.
+BirdCLEF+ 2026 — PERCH ONNX (CPU) + trainable head (GPU) training loop.
+
+Audio stays on CPU through PERCH; embeddings are run on CPU via ONNX Runtime;
+only the linear head runs on CUDA with AMP. Does not modify train.py.
 """
 
 from __future__ import annotations
@@ -15,9 +18,10 @@ import torch.nn as nn
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.amp import GradScaler, autocast
 
-import config as cfg
-from dataset import get_dataloaders, mixup_batch
-from model import FocalLoss, build_model, mixup_criterion
+from config import config, create_experiment_dirs
+from dataset_perch import get_dataloaders_perch, mixup_waveform_batch
+from model import FocalLoss, mixup_criterion
+from model_perch import PerchModel
 
 import torch.backends.cudnn as cudnn
 
@@ -25,12 +29,6 @@ cudnn.enabled = False
 
 
 def set_seed(seed: int) -> None:
-    """
-    Fix RNG seeds and cuDNN flags for reproducible runs (best effort on GPU).
-
-    Sets Python ``random``, NumPy, PyTorch CPU/CUDA, and enables deterministic
-    algorithms where supported.
-    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -41,10 +39,6 @@ def set_seed(seed: int) -> None:
 
 
 def compute_auc(labels: np.ndarray, preds: np.ndarray) -> float:
-    """
-    Macro-averaged ROC-AUC over classes that have at least one positive and
-    one negative label in ``labels`` (other classes are skipped).
-    """
     preds = np.nan_to_num(preds, nan=0.0, posinf=1.0, neginf=0.0)
     n_c = labels.shape[1]
     scores: list[float] = []
@@ -63,10 +57,6 @@ def compute_auc(labels: np.ndarray, preds: np.ndarray) -> float:
 
 
 def compute_map(labels: np.ndarray, preds: np.ndarray) -> float:
-    """
-    Macro-averaged mean average precision; skips classes with no positive
-    samples in ``labels``.
-    """
     preds = np.nan_to_num(preds, nan=0.0, posinf=1.0, neginf=0.0)
     n_c = labels.shape[1]
     scores: list[float] = []
@@ -83,8 +73,6 @@ def compute_map(labels: np.ndarray, preds: np.ndarray) -> float:
 
 
 class CSVLogger:
-    """Append one CSV row per epoch (creates file with header if missing)."""
-
     def __init__(self, path: Path) -> None:
         self.path = path
         self._header = ["epoch", "train_loss", "val_loss", "val_auc", "val_map", "lr"]
@@ -102,7 +90,6 @@ class CSVLogger:
         val_map: float,
         lr: float,
     ) -> None:
-        """Append a single training epoch summary row."""
         with self.path.open("a", newline="") as f:
             csv.writer(f).writerow(
                 [
@@ -116,75 +103,60 @@ class CSVLogger:
             )
 
 
-class Trainer:
-    """
-    One-fold trainer: AdamW + cosine schedule, AMP, focal BCE, mixup (optional).
-
-    Parameters
-    ----------
-    fold :
-        Validation fold index passed to :func:`dataset.get_dataloaders`.
-    """
+class TrainerPerch:
+    """One-fold trainer: PERCH CPU → head GPU, AdamW, cosine LR, focal loss, mixup."""
 
     def __init__(self, fold: int) -> None:
         self.fold = fold
         self.device = torch.device("cuda")
-        self.model = build_model().to(self.device)
+        self.model = PerchModel(head_device=self.device)
         self.criterion = FocalLoss(alpha=1.0, gamma=2.0, reduction="mean")
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=cfg.config.training.learning_rate,
-            weight_decay=cfg.config.training.weight_decay,
+            self.model.head.parameters(),
+            lr=config.training.learning_rate,
+            weight_decay=config.training.weight_decay,
         )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_max=cfg.config.training.num_epochs,
+            T_max=config.training.num_epochs,
             eta_min=1e-6,
         )
-        self.train_loader, self.val_loader = get_dataloaders(fold)
+        self.train_loader, self.val_loader = get_dataloaders_perch(fold)
         self.scaler = GradScaler("cuda")
         self.best_auc = 0.0
-        self.checkpoint_path = Path(cfg.config.paths.checkpoints_dir) / f"fold{fold}_best.pth"
-        self._csv = CSVLogger(Path(cfg.config.paths.logs_dir) / f"fold{fold}_log.csv")
+        self.checkpoint_path = Path(config.paths.checkpoints_dir) / f"fold{fold}_best.pth"
+        self._csv = CSVLogger(Path(config.paths.logs_dir) / f"fold{fold}_log.csv")
 
     def train_one_epoch(self, epoch: int) -> dict[str, float]:
-        """
-        Run one training epoch with optional mixup (50% when enabled) and AMP.
-
-        Returns
-        -------
-        dict
-            ``train_loss`` (mean batch loss) and ``lr`` (optimizer param-group LR).
-        """
         self.model.train()
         total_loss = 0.0
         n_batches = 0
-        alpha = cfg.config.augmentation.mixup_alpha
-        use_mixup = cfg.config.augmentation.use_mixup
+        alpha = config.augmentation.mixup_alpha
+        use_mixup = config.augmentation.use_mixup
 
         for batch in self.train_loader:
             self.optimizer.zero_grad(set_to_none=True)
-            specs = batch["melspec"].to(self.device)
+            waveforms = batch["waveform"]  # CPU (B, n_samples)
             labels = batch["labels"].to(self.device)
 
-            apply_mixup = (
-                use_mixup and alpha > 0 and random.random() < 0.5
-            )
+            apply_mixup = use_mixup and alpha > 0 and random.random() < 0.5
 
             with autocast("cuda"):
                 if apply_mixup:
-                    mixed_specs, la, lb, lam = mixup_batch(
-                        specs, labels, alpha, dual=True
+                    mixed_wav, la, lb, lam = mixup_waveform_batch(
+                        waveforms, labels.cpu(), alpha, dual=True
                     )
-                    logits = self.model(mixed_specs)
+                    la = la.to(self.device)
+                    lb = lb.to(self.device)
+                    logits = self.model(mixed_wav)
                     loss = mixup_criterion(self.criterion, logits, la, lb, lam)
                 else:
-                    logits = self.model(specs)
+                    logits = self.model(waveforms)
                     loss = self.criterion(logits, labels)
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+            nn.utils.clip_grad_norm_(self.model.head.parameters(), max_norm=5.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -196,14 +168,6 @@ class Trainer:
         return {"train_loss": avg_loss, "lr": lr}
 
     def validate(self, epoch: int) -> dict[str, float]:
-        """
-        Evaluate on the validation loader; update best checkpoint by macro ROC-AUC.
-
-        Returns
-        -------
-        dict
-            ``val_loss``, ``val_auc``, ``val_map`` (NaNs possible if metrics undefined).
-        """
         self.model.eval()
         losses: list[float] = []
         all_logits: list[torch.Tensor] = []
@@ -211,12 +175,12 @@ class Trainer:
 
         with torch.no_grad():
             for batch in self.val_loader:
-                specs = batch["melspec"].to(self.device)
+                waveforms = batch["waveform"]
                 labels = batch["labels"].to(self.device)
                 if labels.sum() == 0:
                     continue
                 with autocast("cuda"):
-                    logits = self.model(specs)
+                    logits = self.model(waveforms)
                     loss = self.criterion(logits, labels)
                 losses.append(float(loss.detach()))
                 all_logits.append(logits.float().cpu())
@@ -239,7 +203,7 @@ class Trainer:
                     "optimizer_state": self.optimizer.state_dict(),
                     "auc": float(auc),
                     "map": float(map_score),
-                    "config": cfg.config,
+                    "config": config,
                 },
                 self.checkpoint_path,
             )
@@ -247,20 +211,11 @@ class Trainer:
         return {"val_loss": val_loss, "val_auc": auc, "val_map": map_score}
 
     def fit(self) -> None:
-        """Train for ``cfg.config.training.num_epochs``; log CSV; early-stop on val AUC plateau."""
-        n_ep = cfg.config.training.num_epochs
-        patience = cfg.config.training.early_stopping_patience
-        epochs_no_improve = 0
+        n_ep = config.training.num_epochs
         for epoch in range(n_ep):
             tr = self.train_one_epoch(epoch)
-            prev_best = self.best_auc
             va = self.validate(epoch)
             self.scheduler.step()
-
-            if self.best_auc > prev_best:
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
 
             self._csv.log_row(
                 epoch=epoch + 1,
@@ -281,37 +236,16 @@ class Trainer:
                 f"best_auc={self.best_auc:.4f}"
             )
 
-            if patience > 0 and epochs_no_improve >= patience:
-                print(
-                    f"Early stopping: no val AUC improvement for {patience} epochs "
-                    f"(best_auc={self.best_auc:.4f})."
-                )
-                break
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="BirdCLEF+ 2026 training")
+    parser = argparse.ArgumentParser(description="BirdCLEF+ 2026 PERCH training")
     parser.add_argument("--fold", type=int, default=0, help="Validation fold index")
-    parser.add_argument(
-        "--exp_name",
-        type=str,
-        default=None,
-        help="Override experiment name and paths (checkpoints/logs/oof/submission). "
-        "If omitted, uses paths from config.py.",
-    )
     args = parser.parse_args()
 
-    if args.exp_name:
-        cfg.apply_experiment_name_override(args.exp_name)
-        print(
-            f"Experiment override: {cfg.config.paths.experiment_name!r} -> "
-            f"{cfg.config.paths.experiment_dir!r}"
-        )
+    set_seed(config.training.seed)
+    create_experiment_dirs()
 
-    set_seed(cfg.config.training.seed)
-    cfg.create_experiment_dirs()
-
-    trainer = Trainer(fold=args.fold)
+    trainer = TrainerPerch(fold=args.fold)
     trainer.fit()
     print(f"Best validation ROC-AUC (macro, fold {args.fold}): {trainer.best_auc:.6f}")
 
