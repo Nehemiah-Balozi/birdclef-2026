@@ -21,3 +21,9 @@ __pycache__/
 
 # Logs
 *.log
+*.pth
+*.onnx
+*.whl
+experiments/
+data/
+kaggle_upload_v10/
